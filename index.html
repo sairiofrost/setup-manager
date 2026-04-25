@@ -6,8 +6,7 @@
 <title>SetUp Manager — Llay-Llay</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<script src="https://apis.google.com/js/api.js"></script>
-<script src="https://accounts.google.com/gapi_session"></script>
+<script src="https://accounts.google.com/gsi/client"></script>
 <style>
 :root {
   --bg:       #111111;
@@ -2028,31 +2027,59 @@ function updateSyncStatus(status){
     lastSyncTime ? `Última sincronización: ${lastSyncTime.toLocaleTimeString()}` : '';
 }
 
+let tokenClient = null;
+
 async function initGoogleDrive(){
-  // Inicializar gapi.js
-  if(typeof gapi !== 'undefined'){
-    try {
-      await new Promise((resolve)=>{
-        gapi.load('auth2', resolve);
-      });
-      
-      gapi.auth2.init({
-        client_id: GOOGLE_CONFIG.clientId,
-        scope: GOOGLE_CONFIG.scopes.join(' ')
-      });
-    } catch(err){
-      console.warn('gapi initialization failed:', err);
-    }
+  // Inicializar Google Identity Services (GIS) Token Client
+  if(typeof google !== 'undefined' && google.accounts){
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CONFIG.clientId,
+      scope: GOOGLE_CONFIG.scopes.join(' '),
+      callback: async (tokenResponse)=>{
+        if(tokenResponse && tokenResponse.access_token){
+          localStorage.setItem('google_access_token', tokenResponse.access_token);
+          localStorage.setItem('google_token_expiry', new Date(Date.now() + tokenResponse.expires_in * 1000).toISOString());
+          googleAuth = { access_token: tokenResponse.access_token };
+          document.getElementById('auth-modal').style.display='none';
+          updateSyncStatus('syncing');
+          try {
+            await loadDataFromDrive();
+          } catch(err){
+            console.error('Error cargando datos:', err);
+            updateSyncStatus('error');
+          }
+        }
+      },
+      error_callback: (err)=>{
+        console.error('Error en autenticación:', err);
+        showToast('❌ Error al conectar Google Drive');
+        updateSyncStatus('error');
+      }
+    });
+  } else {
+    console.warn('Google Identity Services no disponible');
   }
-  
+
   // Verificar token en localStorage
   const token = localStorage.getItem('google_access_token');
   if(token && !isTokenExpired()){
     googleAuth = { access_token: token };
     document.getElementById('auth-modal').style.display='none';
     updateSyncStatus('connected');
-    await loadDataFromDrive();
+    try {
+      await loadDataFromDrive();
+    } catch(err){
+      console.error('Error cargando datos desde token guardado:', err);
+      localStorage.removeItem('google_access_token');
+      localStorage.removeItem('google_token_expiry');
+      googleAuth = null;
+      updateSyncStatus('disconnected');
+    }
   } else {
+    if(token){ // Token expirado, limpiar
+      localStorage.removeItem('google_access_token');
+      localStorage.removeItem('google_token_expiry');
+    }
     updateSyncStatus('disconnected');
   }
 }
@@ -2064,38 +2091,11 @@ function isTokenExpired(){
 
 async function connectGoogleDrive(){
   try {
-    // Opción 1: Usando librería gapi.js (recomendado)
-    if(typeof gapi !== 'undefined'){
-      gapi.auth2.getAuthInstance().signIn().then(async (user)=>{
-        const token = user.getAuthResponse().id_token;
-        localStorage.setItem('google_access_token', token);
-        localStorage.setItem('google_token_expiry', new Date(Date.now() + 3600000).toISOString());
-        googleAuth = { access_token: token };
-        document.getElementById('auth-modal').style.display='none';
-        updateSyncStatus('syncing');
-        await loadDataFromDrive();
-      });
+    if(tokenClient){
+      tokenClient.requestAccessToken();
     } else {
-      // Opción 2: Flujo OAuth manual (popupwindow)
-      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
-        `client_id=${GOOGLE_CONFIG.clientId}&` +
-        `redirect_uri=${encodeURIComponent(window.location.origin + '/callback')}&` +
-        `scope=${encodeURIComponent(GOOGLE_CONFIG.scopes.join(' '))}&` +
-        `response_type=token&` +
-        `access_type=offline`;
-      
-      const popup = window.open(authUrl, 'google-auth', 'width=500,height=600');
-      
-      // Esperar respuesta
-      window.handleAuthCallback = async (token)=>{
-        localStorage.setItem('google_access_token', token);
-        localStorage.setItem('google_token_expiry', new Date(Date.now() + 3600000).toISOString());
-        googleAuth = { access_token: token };
-        popup.close();
-        document.getElementById('auth-modal').style.display='none';
-        updateSyncStatus('syncing');
-        await loadDataFromDrive();
-      };
+      showToast('❌ Google Identity Services no cargó. Recarga la página.');
+      updateSyncStatus('error');
     }
   } catch(err){
     console.error('Error en autenticación:', err);
