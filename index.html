@@ -2091,7 +2091,8 @@ function isTokenExpired(){
 
 async function connectGoogleDrive(){
   try {
-    if(tokenClient){
+if(!tokenClient){ await initGoogleDrive(); }
+        if(tokenClient){
       tokenClient.requestAccessToken();
     } else {
       showToast('❌ Google Identity Services no cargó. Recarga la página.');
