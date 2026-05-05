@@ -6,6 +6,7 @@
 <title>SetUp Manager — Llay-Llay</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <script src="https://accounts.google.com/gsi/client"></script>
 <style>
 :root, [data-theme="dark"] {
@@ -2195,6 +2196,66 @@ let isSyncing = false;
 let lastSyncTime = null;
 let proySheetId = localStorage.getItem('proy_spreadsheet_' + currentPlanta) || localStorage.getItem('proy_sheet_id') || null;
 
+// ── XLSX UPLOAD HELPER ────────────────────────
+async function uploadXlsxToDrive(wb, fileName){
+  const token = localStorage.getItem('google_access_token');
+  if(!token) throw new Error('No token');
+  const xlsxData = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+  const blob = new Blob([xlsxData], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const searchRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=name%3D'${encodeURIComponent(fileName)}'+and+'${GOOGLE_CONFIG.folderId}'+in+parents+and+trashed%3Dfalse&fields=files(id)`,
+    {headers:{'Authorization':'Bearer '+token}}
+  );
+  const searchData = await searchRes.json();
+  const existingId = searchData.files && searchData.files.length > 0 ? searchData.files[0].id : null;
+  if(existingId){
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify({name:fileName})], {type:'application/json'}));
+    form.append('file', blob);
+    await fetch('https://www.googleapis.com/upload/drive/v3/files/'+existingId+'?uploadType=multipart', {
+      method:'PATCH', headers:{'Authorization':'Bearer '+token}, body:form
+    });
+  } else {
+    const metadata = {name:fileName, parents:[GOOGLE_CONFIG.folderId], mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'};
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(metadata)], {type:'application/json'}));
+    form.append('file', blob);
+    await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method:'POST', headers:{'Authorization':'Bearer '+token}, body:form
+    });
+  }
+}
+
+// ── SAVE SETUP TO EXCEL ──────────────────────
+async function saveSetupToExcel(){
+  const token = localStorage.getItem('google_access_token');
+  if(!token){ showToast('Conecta Drive primero','warn'); return; }
+  try {
+    const fields = ['Fecha','Maquina','Codigo','Peso (grs)','Velocidad (BPM)','Secciones','Boca',
+      'Anillo','Tube Diameter (In)','Embudo guia (In)','Eje de Alimentación','Correa de Feeder (In)',
+      'Soporte Rodillo','Ajuste de Presión (In)','Deflector','Bisagra molde','Bomba de Vacío',
+      'Filtro de Aire','Lubricación Automático','Puerta de Acceso','Válvula Neumática',
+      'Barra de transferencia','Planchas Muertas','Guía de Salida (In)','Rampa Descarga (deg)',
+      'Expulsor Neumático','Sistema de Etiquetado','Guía Superior (mm)'];
+    const wb = XLSX.utils.book_new();
+    // Una hoja por planta con todos sus registros
+    ['Llay-Llay','Padre Hurtado'].forEach(planta=>{
+      const plantaDB = DB.filter(r=>{
+        const m = r['Maquina']||'';
+        const plantaMaqs = PLANTAS[planta]||[];
+        return plantaMaqs.includes(m);
+      }).sort((a,b)=>new Date(b['Fecha'])-new Date(a['Fecha']));
+      if(!plantaDB.length) return;
+      const rows = plantaDB.map(r=>fields.map(f=>r[f]||''));
+      const ws = XLSX.utils.aoa_to_sheet([fields, ...rows]);
+      ws['!cols'] = fields.map(f=>({wch:Math.max(f.length,14)}));
+      XLSX.utils.book_append_sheet(wb, ws, planta);
+    });
+    await uploadXlsxToDrive(wb, 'SetUp_Data.xlsx');
+    showToast('✅ SetUps guardados como Excel en Drive','ok');
+  } catch(e){ showToast('❌ Error: '+e.message,'error'); }
+}
+
 // ── PROYECCIÓN SHEETS SYNC ───────────────────
 async function saveProyToSheets() {
   const token = localStorage.getItem('google_access_token');
@@ -2280,6 +2341,40 @@ async function saveProyToSheets() {
       body: JSON.stringify({ range: tabName + '!A1', majorDimension: 'ROWS', values: rows })
     });
     showToast('Proyección guardada en Drive (' + tabName + ') ✓', 'ok');
+    // Also save as Excel with all hornos
+    try {
+      const plantaHornos2 = EXT_TABLES[currentPlanta] || {};
+      const wb = XLSX.utils.book_new();
+      for(const [hName, hConf] of Object.entries(plantaHornos2)){
+        const hLines = hConf.lines || [];
+        const hHeader = ['Día','Fecha'];
+        hLines.forEach(l=>{ hHeader.push(l+' Código', l+' BPM', l+' Peso', l+' Gotas'); });
+        hHeader.push('EXT (TON)');
+        const hRows = [hHeader];
+        const days2 = proyGetDays();
+        days2.forEach(d=>{
+          const hRow = [d.label, d.dateStr];
+          let totalExt2 = 0;
+          hLines.forEach(l=>{
+            const k = d.isoDate+'_'+l;
+            const lsK = 'proy_'+currentPlanta+'_'+hName+'_'+l;
+            const st = JSON.parse(localStorage.getItem(lsK)||'{}');
+            const c = st[k]||{};
+            hRow.push(c.codigo||'', c.bpm||'', c.peso||'', c.gotas||'');
+            if(c.bpm && c.peso && c.gotas){
+              const ex = (parseFloat(c.bpm)*parseFloat(c.peso)*parseInt(c.gotas)*60*24)/1e6;
+              totalExt2 += isNaN(ex)?0:ex;
+            }
+          });
+          hRow.push(totalExt2 > 0 ? Math.round(totalExt2*10)/10 : '');
+          hRows.push(hRow);
+        });
+        const ws2 = XLSX.utils.aoa_to_sheet(hRows);
+        ws2['!cols'] = hHeader.map(h=>({wch:Math.max(String(h).length,12)}));
+        XLSX.utils.book_append_sheet(wb, ws2, hName);
+      }
+      await uploadXlsxToDrive(wb, 'Proyeccion_Extraccion_'+currentPlanta.replace(/\s/g,'_')+'.xlsx');
+    } catch(ex){ console.error('Excel proy export error:', ex); }
   } catch(e) { showToast('Error: ' + e.message, 'error'); }
 }
 
@@ -2386,6 +2481,14 @@ async function saveTrazToSheets() {
       body: JSON.stringify({ range: 'Trazabilidad!A1', majorDimension: 'ROWS', values: rows })
     });
     showToast('Trazabilidad guardada en Drive ✓', 'ok');
+    // Also save as Excel
+    try {
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws['!cols'] = header.map(h=>({wch:Math.max(String(h).length,14)}));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Trazabilidad');
+      await uploadXlsxToDrive(wb, 'Trazabilidad_'+currentPlanta.replace(/\s/g,'_')+'.xlsx');
+    } catch(ex){ console.error('Excel traz export error:', ex); }
   } catch(e) { showToast('Error trazabilidad: ' + e.message, 'error'); }
 }
 
@@ -2596,6 +2699,9 @@ async function saveDataToDrive(retries = 3){
       lastSyncTime = new Date();
       updateSyncStatus('connected');
       console.log('✅ Sync successful');
+      // Debounced Excel export
+      clearTimeout(window._setupExcelTimeout);
+      window._setupExcelTimeout = setTimeout(()=>saveSetupToExcel().catch(e=>console.error('Excel export:',e)), 5000);
       return; // Éxito
       
     } catch(err){
