@@ -909,7 +909,10 @@ tbody tr.row-master{
           <div class="art-banner-sub">Vida útil de componentes por línea</div>
         </div>
         <div id="traz-line-toggles" style="display:flex;gap:8px;flex-wrap:wrap"></div>
-      </div>
+      
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-primary" onclick="saveTrazToSheets()" style="font-size:13px">📤 Drive</button>
+      </div></div>
 
       <div id="traz-grid"></div>
     </div>
@@ -1713,6 +1716,10 @@ function trazEdit(maq, fechaKey, dbIdx, btn){
       </button>
       <button onclick="
         const v=document.getElementById('traz-date-input').value;
+        // Persistir en localStorage y auto-sincronizar con Drive
+        localStorage.setItem('db_cache', JSON.stringify(DB));
+        clearTimeout(window._trazSaveTimer);
+        window._trazSaveTimer = setTimeout(saveTrazToSheets, 2000);
         if(v){ DB[${dbIdx}]['${fechaKey}']=v; renderTrazGrid(); showToast('✓ Fecha guardada'); }
         document.getElementById('traz-edit-panel').remove();
         document.querySelectorAll('.traz-edit-btn.active').forEach(b=>{b.classList.remove('active');b.textContent='✏';});"
@@ -2186,128 +2193,94 @@ const GOOGLE_CONFIG = {
 let googleAuth = null;
 let isSyncing = false;
 let lastSyncTime = null;
-let proySheetId = localStorage.getItem('proy_sheet_id') || null;
+let proySheetId = localStorage.getItem('proy_spreadsheet_' + currentPlanta) || localStorage.getItem('proy_sheet_id') || null;
 
 // ── PROYECCIÓN SHEETS SYNC ───────────────────
-async function saveProyToSheets(){
-  if(!googleAuth){
-    showToast('⚠️ Conecta Drive para guardar proyección');
-    return;
-  }
+async function saveProyToSheets() {
+  const token = localStorage.getItem('google_access_token');
+  if (!token) { showToast('Conecta Drive primero', 'warn'); return; }
   try {
-    const selVal = document.getElementById('proy-horno').value;
-    if(!selVal) return;
-    const [hornoName, lineOrAll] = selVal.split('|');
-    const horno = EXT_TABLES[currentPlanta]?.[hornoName];
-    if(!horno) return;
+    const selEl = document.getElementById('proy-horno');
+    const selVal = selEl ? selEl.value : 'Horno F|ALL';
+    const [hornoKey, lineOrAll] = selVal.split('|');
+    const plantaHornos = PLANTAS[currentPlanta] && PLANTAS[currentPlanta].hornos ? PLANTAS[currentPlanta].hornos : {};
+    const hornoConfig = plantaHornos[hornoKey] || {};
     const isTotal = lineOrAll === 'ALL';
-    const lines = isTotal ? horno.lines : [lineOrAll];
-    const days = proyGetDays();
-    if(!days.length) return;
-
-    // Build header row
-    const header = ['Día','Fecha'];
-    lines.forEach(l=>{ header.push(l+' Código', l+' BPM', l+' Peso', l+' Gotas'); });
-    header.push('EXT (TON)','Delta','Cambios','Rango');
-
-    // Build data rows
+    const hornoLines = hornoConfig.lines || [];
+    const lines = isTotal ? hornoLines : [lineOrAll];
+    const periodoEl = document.getElementById('proy-periodo');
+    const periodo = periodoEl ? periodoEl.value : 'semana';
+    const days = proyGetDays(periodo);
+    const header = ['Día', 'Fecha'];
+    lines.forEach(l => { header.push(l + ' Código', l + ' BPM', l + ' Peso', l + ' Gotas'); });
+    header.push('EXT (TON)', 'Δ', 'Cambios', 'Rango');
     const rows = [header];
-    let prevExt = 0;
-    let prevCodigos = {};
-    days.forEach((day, di)=>{
-      const row = [day.label, day.dateStr];
+    let prevExt = null;
+    const prevCodigos = {};
+    lines.forEach(l => { prevCodigos[l] = null; });
+    days.forEach(d => {
+      const row = [d.label, d.dateStr];
+      let totalExt = 0, cambios = 0;
       const currentCodigos = {};
-      let totalExt = 0;
-      lines.forEach(l=>{
-        const key = day.dateStr+'_'+l;
-        const bpmEl = document.querySelector(`[data-key="${key}"][data-field="bpm"]`);
-        const pesoEl = document.querySelector(`[data-key="${key}"][data-field="peso"]`);
-        const gotasEl = document.querySelector(`[data-key="${key}"][data-field="gotas"]`);
-        const codigoEl = document.querySelector(`[data-key="${key}"][data-field="codigo"]`);
-        const bpm = bpmEl ? parseFloat(bpmEl.value)||0 : 0;
-        const peso = pesoEl ? parseFloat(pesoEl.value)||0 : 0;
-        const gotas = gotasEl ? parseFloat(gotasEl.value)||2 : 2;
-        const codigo = codigoEl ? codigoEl.value : '';
-        row.push(codigo, bpm||'', peso||'', gotas);
-        if(bpm && peso) totalExt += (bpm * peso * 1.44) / 1000;
-        currentCodigos[l] = codigo.trim();
+      lines.forEach(l => {
+        const key = d.isoDate + '_' + l;
+        const lsKey = 'proy_' + currentPlanta + '_' + hornoKey + '_' + l;
+        const stored = JSON.parse(localStorage.getItem(lsKey) || '{}');
+        const cell = stored[key] || {};
+        const codigo = cell.codigo || '', bpm = cell.bpm || '', peso = cell.peso || '', gotas = cell.gotas || '';
+        row.push(codigo, bpm, peso, gotas);
+        currentCodigos[l] = codigo;
+        if (bpm && peso && gotas) {
+          const ext = (parseFloat(bpm) * parseFloat(peso) * parseInt(gotas) * 60 * 24) / 1e6;
+          totalExt += isNaN(ext) ? 0 : ext;
+        }
+        if (codigo && prevCodigos[l] !== null && codigo !== prevCodigos[l]) cambios++;
       });
-      const extRound = Math.round(totalExt);
-      const delta = (di > 0 && prevExt > 0 && extRound > 0) ? extRound - prevExt : '';
-      let cambios = 0;
-      if(di > 0){
-        for(const [l, c] of Object.entries(currentCodigos)){
-          if(c && prevCodigos[l] && c !== prevCodigos[l]) cambios++;
-        }
-      }
-      let rango = '';
-      if(horno && extRound > 0){
-        const range = getExtRange(horno.data, extRound);
-        if(range){
-          if(extRound < range.limInf) rango = 'BAJO';
-          else if(extRound > range.limSup) rango = 'SOBRE';
-          else rango = 'OK';
-        }
-      }
-      row.push(extRound||'', delta, cambios||'', rango);
+      lines.forEach(l => { prevCodigos[l] = currentCodigos[l]; });
+      const extRound = totalExt > 0 ? Math.round(totalExt * 10) / 10 : '';
+      const delta = (prevExt !== null && extRound !== '') ? Math.round((extRound - prevExt) * 10) / 10 : '';
+      const cap = hornoConfig.cap || [];
+      const rango = (extRound !== '' && cap.length >= 2) ? (extRound >= cap[0] && extRound <= cap[1] ? 'EN RANGO' : 'FUERA') : '';
+      if (extRound !== '') prevExt = extRound;
+      row.push(extRound, delta, cambios || '', rango);
       rows.push(row);
-      if(extRound > 0) prevExt = extRound;
-      prevCodigos = {...currentCodigos};
     });
-
-    const sheetTitle = `Proy ${currentPlanta} ${hornoName} ${lineOrAll === 'ALL' ? 'Total' : lineOrAll}`;
-
-    if(proySheetId){
-      // Update existing sheet
-      try {
-        // Clear and rewrite
-        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${proySheetId}/values/A:Z?valueInputOption=RAW`, {
-          method: 'PUT',
-          headers: { 'Authorization': `Bearer ${googleAuth.access_token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ range: 'A:Z', majorDimension: 'ROWS', values: rows })
-        });
-        showToast('✅ Proyección actualizada en Google Sheets');
-      } catch(e){
-        console.error('Error updating sheet, creating new:', e);
-        proySheetId = null;
-        localStorage.removeItem('proy_sheet_id');
-        await saveProyToSheets();
-        return;
-      }
-    } else {
-      // Create new spreadsheet
+    const auth = 'Bearer ' + token;
+    const spreadsheetIdKey = 'proy_spreadsheet_' + currentPlanta;
+    let spreadsheetId = localStorage.getItem(spreadsheetIdKey) || localStorage.getItem('proy_sheet_id');
+    const tabName = hornoKey;
+    if (!spreadsheetId) {
+      const hornoNames = Object.keys(plantaHornos);
+      const sheetsSpec = hornoNames.length > 0 ? hornoNames.map(h => ({ properties: { title: h } })) : [{ properties: { title: hornoKey } }];
       const createRes = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${googleAuth.access_token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          properties: { title: sheetTitle },
-          sheets: [{ properties: { title: 'Proyección' } }]
-        })
+        method: 'POST', headers: { Authorization: auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ properties: { title: 'Proyección Extracción ' + currentPlanta }, sheets: sheetsSpec })
       });
-      if(!createRes.ok) throw new Error('Create sheet failed: ' + createRes.status);
-      const sheet = await createRes.json();
-      proySheetId = sheet.spreadsheetId;
-      localStorage.setItem('proy_sheet_id', proySheetId);
-
-      // Move to folder
-      await fetch(`https://www.googleapis.com/drive/v3/files/${proySheetId}?addParents=${GOOGLE_CONFIG.folderId}`, {
-        method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${googleAuth.access_token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      });
-
-      // Write data
-      await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${proySheetId}/values/Proyección!A:Z?valueInputOption=RAW`, {
-        method: 'PUT',
-        headers: { 'Authorization': `Bearer ${googleAuth.access_token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ range: 'Proyección!A:Z', majorDimension: 'ROWS', values: rows })
-      });
-      showToast('✅ Proyección creada en Google Sheets');
+      if (!createRes.ok) throw new Error('Create failed: ' + createRes.status);
+      const createData = await createRes.json();
+      spreadsheetId = createData.spreadsheetId;
+      localStorage.setItem(spreadsheetIdKey, spreadsheetId);
+      localStorage.setItem('proy_sheet_id', spreadsheetId);
+    } else {
+      const infoRes = await fetch('https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + '?fields=sheets.properties.title', { headers: { Authorization: auth } });
+      if (infoRes.ok) {
+        const info = await infoRes.json();
+        const tabs = (info.sheets || []).map(s => s.properties.title);
+        if (!tabs.includes(tabName)) {
+          await fetch('https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + ':batchUpdate', {
+            method: 'POST', headers: { Authorization: auth, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requests: [{ addSheet: { properties: { title: tabName } } }] })
+          });
+        }
+      }
     }
-  } catch(err){
-    console.error('Error saving proyección to Sheets:', err);
-    showToast('❌ Error al guardar proyección: ' + err.message);
-  }
+    await fetch('https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + '/values/' + encodeURIComponent(tabName + '!A1:ZZ1000') + ':clear', { method: 'POST', headers: { Authorization: auth, 'Content-Type': 'application/json' } });
+    await fetch('https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + '/values/' + encodeURIComponent(tabName + '!A1') + '?valueInputOption=USER_ENTERED', {
+      method: 'PUT', headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ range: tabName + '!A1', majorDimension: 'ROWS', values: rows })
+    });
+    showToast('Proyección guardada en Drive (' + tabName + ') ✓', 'ok');
+  } catch(e) { showToast('Error: ' + e.message, 'error'); }
 }
 
 async function loadProyFromSheets(){
@@ -2361,6 +2334,71 @@ async function loadProyFromSheets(){
   }
 }
 
+// ═══════════════════════════════════════════════
+// TRAZABILIDAD — GOOGLE SHEETS SYNC
+// ═══════════════════════════════════════════════
+
+async function saveTrazToSheets() {
+  const token = localStorage.getItem('google_access_token');
+  if (!token) { showToast('Conecta Drive primero', 'warn'); return; }
+  try {
+    const sheetIdKey = 'traz_sheet_id_' + currentPlanta;
+    let trazSheetId = localStorage.getItem(sheetIdKey);
+    const plantaConfig = PLANTAS[currentPlanta];
+    const allLines = plantaConfig ? plantaConfig.maquinas : ['F1','F2','F3','G1','G2','G3'];
+    const header = ['Línea','Código','Fecha SetUp'];
+    TRAZ_COMPONENTS.forEach(c => {
+      header.push(c.label + ' Valor', c.label + ' Fecha', c.label + ' Vida(sem)', c.label + ' % Usado', c.label + ' Estado');
+    });
+    const rows = [header];
+    allLines.forEach(maq => {
+      const rec = DB.filter(r => r['Maquina'] === maq).sort((a,b) => b['Fecha'].localeCompare(a['Fecha']))[0];
+      const row = [maq, rec ? (rec['Codigo'] || '') : '', rec ? (rec['Fecha'] || '') : ''];
+      TRAZ_COMPONENTS.forEach(comp => {
+        const val = rec ? (rec[comp.key] || '') : '';
+        const fechaVal = rec ? (rec[comp.fechaKey] || '') : '';
+        const semanas = comp.semanas;
+        let pct = '', estado = '';
+        if (fechaVal && semanas) {
+          const diasVida = semanas * 7;
+          const diasUsados = Math.round((new Date() - new Date(fechaVal)) / 86400000);
+          pct = diasVida > 0 ? Math.min(100, Math.round(diasUsados / diasVida * 100)) : '';
+          estado = pct >= 100 ? 'VENCIDO' : pct >= 80 ? 'POR VENCER' : 'OK';
+        }
+        row.push(String(val), String(fechaVal), semanas ? String(semanas) : '', String(pct), String(estado));
+      });
+      rows.push(row);
+    });
+    const auth = 'Bearer ' + token;
+    if (!trazSheetId) {
+      const createRes = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+        method: 'POST', headers: { Authorization: auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ properties: { title: 'Trazabilidad ' + currentPlanta }, sheets: [{ properties: { title: 'Trazabilidad' } }] })
+      });
+      if (!createRes.ok) throw new Error('Create failed: ' + createRes.status);
+      const d = await createRes.json();
+      trazSheetId = d.spreadsheetId;
+      localStorage.setItem(sheetIdKey, trazSheetId);
+    }
+    await fetch('https://sheets.googleapis.com/v4/spreadsheets/' + trazSheetId + '/values/Trazabilidad!A1:ZZ1000:clear', { method: 'POST', headers: { Authorization: auth, 'Content-Type': 'application/json' } });
+    await fetch('https://sheets.googleapis.com/v4/spreadsheets/' + trazSheetId + '/values/Trazabilidad!A1?valueInputOption=USER_ENTERED', {
+      method: 'PUT', headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ range: 'Trazabilidad!A1', majorDimension: 'ROWS', values: rows })
+    });
+    showToast('Trazabilidad guardada en Drive ✓', 'ok');
+  } catch(e) { showToast('Error trazabilidad: ' + e.message, 'error'); }
+}
+
+async function loadTrazFromSheets() {
+  const token = localStorage.getItem('google_access_token');
+  if (!token) return;
+  const sheetIdKey = 'traz_sheet_id_' + currentPlanta;
+  const trazSheetId = localStorage.getItem(sheetIdKey);
+  if (!trazSheetId) return;
+  // Trazabilidad data lives in the main DB (db_cache); this function is a hook for future use
+}
+
+
 function updateSyncStatus(status){
   const bar = document.getElementById('sync-status-bar');
   if(!bar) return;
@@ -2397,6 +2435,7 @@ async function initGoogleDrive(){
           try {
             await loadDataFromDrive();
             await loadProyFromSheets();
+            await loadTrazFromSheets();
           } catch(err){
             console.error('Error cargando datos:', err);
             updateSyncStatus('error');
